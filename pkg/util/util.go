@@ -84,6 +84,8 @@ type E2e51pwn struct {
 	RelayPeerInfo     *peer.AddrInfo
 	EnableRelayServer bool
 	IsServer          bool
+	Client            *sync.Map
+	ClientLists       []string
 }
 
 // 基于 p2p 通讯
@@ -91,7 +93,7 @@ func NewE2e51pwn(ctx context.Context) *E2e51pwn {
 	cbk := func(r *E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
 		log.Println("PeerCbk、E2eProtocolCbk -> ", s.Conn().RemotePeer(), s.Conn().RemoteMultiaddr().String())
 	}
-	e1 := &E2e51pwn{NCnt: 0, Ctx: ctx, PeerCbk: cbk, E2eProtocolCbk: cbk, EnableRelayServer: true}
+	e1 := &E2e51pwn{Client: &sync.Map{}, NCnt: 0, Ctx: ctx, PeerCbk: cbk, E2eProtocolCbk: cbk, EnableRelayServer: true}
 	//e1.initHost()
 	return e1
 }
@@ -295,7 +297,7 @@ func (r *E2e51pwn) initHost() {
 		log.Println("libp2p.New", err)
 	}
 	r.Host = host
-	host.SetStreamHandler(E2eProtocol, r.E2eProtocolHandler)
+
 	//log.Println(host.Network().LocalPeer().String())
 	// 连接到 replay 穿透服务
 	//host.Connect(ctx, *CreatePeerAddr(E2eReplayServer))
@@ -312,6 +314,12 @@ func (r *E2e51pwn) initHost() {
 			log.Println("r.SetupMdnsDiscovery ok")
 		}
 	}
+	if r.CheckIsServer() {
+		r.RegE2eProtocolCbk(r.RegClient)
+	} else {
+		r.RegE2eProtocolCbk(r.getClientLists)
+	}
+	host.SetStreamHandler(E2eProtocol, r.E2eProtocolHandler)
 	log.Println("host.ID = ", host.ID(), host.Addrs())
 	r.doDht()
 	//r.GetP2pPort(multiaddr.P_TCP)
@@ -432,9 +440,11 @@ func (r *E2e51pwn) ConnectPeers(aPeer ...string) {
 							// Create a buffered stream so that read and writes are non blocking.
 							rw := bufio.NewReadWriter(bufio.NewReader(ss), bufio.NewWriter(ss))
 							r.E2eProtocolCbk(r, rw, ss)
-							//if n, err := rw.Write([]byte("ok")); nil == err {
-							//	log.Println("rw.Write = ", n)
-							//}
+
+							if n, err := rw.Write([]byte("ok")); nil == err {
+								log.Println("rw.Write = ", n)
+							}
+							rw.Flush()
 						}
 					}
 				} else {
@@ -482,6 +492,60 @@ func (r *E2e51pwn) E2eProtocolHandler(s network.Stream) {
 	r.Host.Peerstore().AddAddrs(s.Conn().RemotePeer(), []ma.Multiaddr{s.Conn().RemoteMultiaddr()}, peerstore.PermanentAddrTTL)
 	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
 	r.E2eProtocolCbk(r, rw, s)
+}
+
+// 客户端注册的一些信息
+type ClientData struct {
+	Rw     *bufio.ReadWriter `json:"rw"`
+	Stream network.Stream    `json:"stream"`
+}
+
+// 获取 其他 客户端信息
+func (r *E2e51pwn) getClientLists(e *E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
+	var data = make([]byte, 1024*800)
+	if n, err := rw.Read(data); 0 < n && nil == err {
+		data = data[0:n]
+		var a []string
+		if err := json.Unmarshal(data, &a); nil == err {
+			if 0 < len(a) {
+				r.ClientLists = a
+				log.Println("other client lists", a)
+			}
+		}
+	}
+}
+
+// 注册客户端
+func (r *E2e51pwn) RegClient(e *E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
+	szId := s.Conn().RemotePeer()
+	if r.CheckPeerId(szId) {
+		return
+	}
+	r.Client.Store(szId, &ClientData{Rw: rw, Stream: s})
+	log.Println("RegClient ok: ", s.Conn().RemotePeer(), s.Conn().RemoteMultiaddr())
+	var a []string
+	s1 := fmt.Sprintf("%v", szId)
+	s2 := fmt.Sprintf("%s/p2p/%s", s.Conn().RemoteMultiaddr(), szId)
+	var a1 = []string{s2}
+	data1, _ := json.Marshal(a1)
+	r.Client.Range(func(k, v any) bool {
+		if fmt.Sprintf("%v", k) != s1 {
+			// 将当前 节点 信息告知在这之前注册的节点
+			if o, ok := v.(*ClientData); ok {
+				a = append(a, fmt.Sprintf("%s/p2p/%s", o.Stream.Conn().RemoteMultiaddr(), k))
+				o.Rw.Write(data1)
+				o.Rw.Flush()
+			}
+		}
+		return true
+	})
+	// 将之前注册的节点信息，告知当前注册的节点
+	if 0 < len(a) {
+		if data, err := json.Marshal(a); nil == err {
+			rw.Write(data)
+			rw.Flush()
+		}
+	}
 }
 
 func (r *E2e51pwn) CreatePeerAddr(s string) *peer.AddrInfo {
