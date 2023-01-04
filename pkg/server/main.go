@@ -17,7 +17,7 @@ import (
 func main() {
 	util1.DoInitAll()
 	app := kingpin.New("E2E/P2P network", "001")
-	//oMod := app.Flag("isServer", "isServer").Default("false").Short('s').Bool()
+	oMod := app.Flag("isServer", "isServer").Default("false").Short('s').Bool()
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -26,6 +26,12 @@ func main() {
 	e2e.RegE2eProtocolCbk(func(pwn *util.E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
 		log.Println("e2e.RegE2eProtocolCbk ->", s.Conn().RemotePeer(), s.Protocol(), s.Conn().RemoteMultiaddr())
 	})
+	e2e.RegE2eProtocolCbk(func(pwn *util.E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
+		log.Println("p2 :::> e2e.RegE2eProtocolCbk ->", s.Conn().RemoteMultiaddr())
+	})
+	if *oMod {
+		e2e.StartSocks5Handler()
+	}
 	//e2e.EnableRelayServer = false
 	host := e2e.CreateHost()
 	//e2e.ConnectPeers4Relay("103.174.136.111/tcp/35711")

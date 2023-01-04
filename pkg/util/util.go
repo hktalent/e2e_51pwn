@@ -86,6 +86,7 @@ type E2e51pwn struct {
 	IsServer          bool
 	Client            *sync.Map
 	ClientLists       []string
+	Socks5            *RSocks5Imp
 }
 
 // 基于 p2p 通讯
@@ -169,26 +170,26 @@ func (r *E2e51pwn) RegCbk(cbkOld func(*E2e51pwn, *bufio.ReadWriter), cbk ...func
 		})
 	}
 }
+
+// 注册 E2eProtocol 处理函数链
 func (r *E2e51pwn) RegE2eProtocolCbk(cbk ...func(*E2e51pwn, *bufio.ReadWriter, network.Stream)) {
 	old := r.E2eProtocolCbk
 	r.E2eProtocolCbk = func(r1 *E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
-		util1.DoSyncFunc(func() {
-			for _, x1 := range cbk {
-				x1(r1, rw, s)
-			}
-			old(r1, rw, s)
-		})
+		for _, x1 := range cbk {
+			x1(r1, rw, s)
+		}
+		old(r1, rw, s)
 	}
 }
+
+// 注册 peer 处理链
 func (r *E2e51pwn) RegPeerCbk(cbk ...func(*E2e51pwn, *bufio.ReadWriter, network.Stream)) {
 	old := r.PeerCbk
 	r.PeerCbk = func(r1 *E2e51pwn, rw *bufio.ReadWriter, s network.Stream) {
-		util1.DoSyncFunc(func() {
-			for _, x1 := range cbk {
-				x1(r1, rw, s)
-			}
-			old(r1, rw, s)
-		})
+		for _, x1 := range cbk {
+			x1(r1, rw, s)
+		}
+		old(r1, rw, s)
 	}
 }
 
@@ -316,7 +317,7 @@ func (r *E2e51pwn) initHost() {
 	}
 	if r.CheckIsServer() {
 		r.RegE2eProtocolCbk(r.RegClient)
-	} else {
+	} else if nil == r.Socks5 {
 		r.RegE2eProtocolCbk(r.getClientLists)
 	}
 	host.SetStreamHandler(E2eProtocol, r.E2eProtocolHandler)
@@ -372,14 +373,13 @@ func (r *E2e51pwn) GetP2pPort(nType int) string {
 // 相同的id就跳过 不连接自己
 func (r *E2e51pwn) CheckPeerId(id peer.ID) bool {
 	if nil != r.Host && id == r.Host.ID() {
-		log.Println(r.Host.ID(), "==", id)
+		//log.Println(r.Host.ID(), "==", id)
 		return true
 	}
 	return false
 }
 
 // call back regPeerCbk
-// ns
 func (r *E2e51pwn) FindPeers() {
 	log.Println("Announcing ourselves...")
 	routingDiscovery := drouting.NewRoutingDiscovery(r.KademliaDHT)
@@ -435,16 +435,16 @@ func (r *E2e51pwn) ConnectPeers(aPeer ...string) {
 					if err := r.Host.Connect(r.Ctx, *peerinfo); err != nil {
 						log.Println("r.Host.Connect ", err, peerinfo.Addrs, peerinfo.ID)
 					} else {
-						log.Println("Connection bootstrap node:", *peerinfo)
+						log.Println("start Connection bootstrap node:", *peerinfo)
 						if ss, err := r.Host.NewStream(network.WithUseTransient(r.Ctx, E2eKey), peerinfo.ID, E2eProtocol); nil == err {
-							// Create a buffered stream so that read and writes are non blocking.
 							rw := bufio.NewReadWriter(bufio.NewReader(ss), bufio.NewWriter(ss))
 							r.E2eProtocolCbk(r, rw, ss)
-
-							if n, err := rw.Write([]byte("ok")); nil == err {
-								log.Println("rw.Write = ", n)
-							}
-							rw.Flush()
+							//if n, err := rw.Write([]byte("ok")); nil == err {
+							//	log.Println("rw.Write = ", n)
+							//}
+							//rw.Flush()
+						} else {
+							log.Println("ConnectPeers -> r.Host.NewStream:", err)
 						}
 					}
 				} else {
@@ -498,6 +498,19 @@ func (r *E2e51pwn) E2eProtocolHandler(s network.Stream) {
 type ClientData struct {
 	Rw     *bufio.ReadWriter `json:"rw"`
 	Stream network.Stream    `json:"stream"`
+	Time   int64             `json:"time"`
+}
+
+/*
+启动socks5 server，并将 p2p/e2e E2eProtocol 到达的链接 pipe 到socks5
+ 该函数在 e2e.CreateHost 之前运行
+ 启动后默认的 r.getClientLists 将不再运行
+*/
+func (r *E2e51pwn) StartSocks5Handler() {
+	r.Socks5 = NewRSocks5(nil)
+	r.RegE2eProtocolCbk(func(pwn *E2e51pwn, rw *bufio.ReadWriter, stream network.Stream) {
+		r.Socks5.PipData(rw)
+	})
 }
 
 // 获取 其他 客户端信息
@@ -521,17 +534,23 @@ func (r *E2e51pwn) RegClient(e *E2e51pwn, rw *bufio.ReadWriter, s network.Stream
 	if r.CheckPeerId(szId) {
 		return
 	}
-	r.Client.Store(szId, &ClientData{Rw: rw, Stream: s})
-	log.Println("RegClient ok: ", s.Conn().RemotePeer(), s.Conn().RemoteMultiaddr())
+	r.Client.Store(szId, &ClientData{Rw: rw, Stream: s, Time: time.Now().Unix()})
 	var a []string
 	s1 := fmt.Sprintf("%v", szId)
 	s2 := fmt.Sprintf("%s/p2p/%s", s.Conn().RemoteMultiaddr(), szId)
+	log.Println("RegClient ok: ", s2)
 	var a1 = []string{s2}
 	data1, _ := json.Marshal(a1)
+	// 10 分钟前的删除
+	n1 := time.Now().Unix() - 10*60
 	r.Client.Range(func(k, v any) bool {
-		if fmt.Sprintf("%v", k) != s1 {
-			// 将当前 节点 信息告知在这之前注册的节点
-			if o, ok := v.(*ClientData); ok {
+		if o, ok := v.(*ClientData); ok {
+			if n1 >= o.Time {
+				r.Client.Delete(k)
+				return true
+			}
+			if fmt.Sprintf("%v", k) != s1 {
+				// 将当前 节点 信息告知在这之前注册的节点
 				a = append(a, fmt.Sprintf("%s/p2p/%s", o.Stream.Conn().RemoteMultiaddr(), k))
 				o.Rw.Write(data1)
 				o.Rw.Flush()
